@@ -295,7 +295,7 @@ export interface Model {
   author: string;
   name: string;
   type?: string;
-  description: string;
+  capabilities?: string[]; // Array of capability keys for localization
   size: number; // Size in bytes
   params: number;
   isDownloaded: boolean;
@@ -349,7 +349,7 @@ export interface HuggingFaceModel {
   _id: string;
   id: string;
   author: string;
-  gated: boolean;
+  gated: boolean | string;
   inference: string;
   lastModified: string;
   likes: number;

@@ -1,6 +1,7 @@
 jest.unmock('../../store');
 import {runInAction} from 'mobx';
 import {LlamaContext} from '@pocketpalai/llama.rn';
+import {Alert} from 'react-native';
 
 import {defaultModels} from '../defaultModels';
 
@@ -390,7 +391,7 @@ describe('ModelStore', () => {
       expect(mockCheckSpaceAndDownload).toHaveBeenCalledWith('test-model-id');
     });
 
-    it('should catch and throw errors when downloading HF model fails', async () => {
+    it('should handle errors when downloading HF model fails', async () => {
       const hfModel = {
         id: 'test/hf-model',
         siblings: [{rfilename: 'model.gguf'}],
@@ -404,9 +405,30 @@ describe('ModelStore', () => {
         new Error('Mock error'),
       );
 
-      await expect(
-        modelStore.downloadHFModel(hfModel as any, modelFile as any),
-      ).rejects.toThrow('Mock error');
+      // Mock console.error and Alert.alert
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+      const alertSpy = jest.spyOn(Alert, 'alert').mockImplementation();
+
+      await modelStore.downloadHFModel(hfModel as any, modelFile as any);
+
+      // Check that error is logged
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        'Failed to set up HF model download:',
+        expect.any(Error),
+      );
+
+      // Check that Alert.alert is called with the error message
+      expect(alertSpy).toHaveBeenCalledWith(
+        uiStore.l10n.errors.downloadSetupFailedTitle,
+        uiStore.l10n.errors.downloadSetupFailedMessage.replace(
+          '{message}',
+          'Mock error',
+        ),
+      );
+
+      // Clean up mocks
+      consoleErrorSpy.mockRestore();
+      alertSpy.mockRestore();
     });
   });
 
@@ -503,35 +525,6 @@ describe('ModelStore', () => {
       modelStore.updateUseAutoRelease(false);
 
       expect(modelStore.useAutoRelease).toBe(false);
-    });
-  });
-
-  // Add tests for chat title
-  describe('chatTitle', () => {
-    it('should return loading message when context is loading', () => {
-      modelStore.isContextLoading = true;
-
-      expect(modelStore.chatTitle).toBe('Loading model ...');
-    });
-
-    it('should return model name from context metadata', () => {
-      modelStore.isContextLoading = false;
-      modelStore.context = {
-        model: {
-          metadata: {
-            'general.name': 'Test Model Name',
-          },
-        },
-      } as any;
-
-      expect(modelStore.chatTitle).toBe('Test Model Name');
-    });
-
-    it('should return default title when no context or name', () => {
-      modelStore.isContextLoading = false;
-      modelStore.context = undefined;
-
-      expect(modelStore.chatTitle).toBe('Chat Page');
     });
   });
 

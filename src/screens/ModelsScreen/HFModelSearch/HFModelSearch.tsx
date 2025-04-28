@@ -1,4 +1,11 @@
-import React, {useState, useCallback, useMemo, useRef, useEffect} from 'react';
+import React, {
+  useState,
+  useCallback,
+  useMemo,
+  useRef,
+  useEffect,
+  useContext,
+} from 'react';
 
 import {observer} from 'mobx-react';
 import debounce from 'lodash/debounce';
@@ -19,6 +26,7 @@ import {DetailsView} from './DetailsView';
 import {hfStore} from '../../../store';
 
 import {HuggingFaceModel} from '../../../utils/types';
+import {L10nContext} from '../../../utils';
 
 interface HFModelSearchProps {
   visible: boolean;
@@ -29,6 +37,10 @@ const DEBOUNCE_DELAY = 500;
 
 export const HFModelSearch: React.FC<HFModelSearchProps> = observer(
   ({visible, onDismiss}) => {
+    const l10n = useContext(L10nContext);
+    const theme = useTheme();
+    const styles = createStyles(theme);
+
     const [detailsVisible, setDetailsVisible] = useState(false);
     const [selectedModel, setSelectedModel] = useState<HuggingFaceModel | null>(
       null,
@@ -62,8 +74,10 @@ export const HFModelSearch: React.FC<HFModelSearchProps> = observer(
     );
 
     useEffect(() => {
-      handleSearchChange(hfStore.searchQuery);
-    }, [handleSearchChange]);
+      if (visible) {
+        handleSearchChange(hfStore.searchQuery);
+      }
+    }, [handleSearchChange, visible]);
 
     useEffect(() => {
       if (visible) {
@@ -100,8 +114,12 @@ export const HFModelSearch: React.FC<HFModelSearchProps> = observer(
       [],
     );
 
-    const theme = useTheme();
-    const styles = createStyles(theme);
+    const handleSheetDismiss = () => {
+      console.log('Search sheet dismissed, clearing error state');
+      // Clear error state when the sheet is closed
+      hfStore.clearError();
+      onDismiss();
+    };
 
     return (
       <Portal>
@@ -111,7 +129,7 @@ export const HFModelSearch: React.FC<HFModelSearchProps> = observer(
             index={0}
             snapPoints={['92%']}
             enableDynamicSizing={false}
-            onDismiss={onDismiss}
+            onDismiss={handleSheetDismiss}
             enablePanDownToClose
             enableContentPanningGesture={false}
             handleIndicatorStyle={styles.bottomSheetHandle}
@@ -130,11 +148,13 @@ export const HFModelSearch: React.FC<HFModelSearchProps> = observer(
                the theme context for all Paper components inside
           */}
             <PaperProvider theme={theme}>
-              <SearchView
-                testID="hf-model-search-view"
-                onModelSelect={handleModelSelect}
-                onChangeSearchQuery={handleSearchChange}
-              />
+              <L10nContext.Provider value={l10n}>
+                <SearchView
+                  testID="hf-model-search-view"
+                  onModelSelect={handleModelSelect}
+                  onChangeSearchQuery={handleSearchChange}
+                />
+              </L10nContext.Provider>
             </PaperProvider>
           </BottomSheetModal>
 
@@ -151,9 +171,11 @@ export const HFModelSearch: React.FC<HFModelSearchProps> = observer(
             backdropComponent={renderBackdrop}>
             {/* PaperProvider is needed here to restore theme context. see the comment above. */}
             <PaperProvider theme={theme}>
-              <BottomSheetScrollView>
-                {selectedModel && <DetailsView hfModel={selectedModel} />}
-              </BottomSheetScrollView>
+              <L10nContext.Provider value={l10n}>
+                <BottomSheetScrollView>
+                  {selectedModel && <DetailsView hfModel={selectedModel} />}
+                </BottomSheetScrollView>
+              </L10nContext.Provider>
             </PaperProvider>
           </BottomSheetModal>
         </BottomSheetModalProvider>
