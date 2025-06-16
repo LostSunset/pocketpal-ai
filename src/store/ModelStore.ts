@@ -10,16 +10,26 @@ import {v4 as uuidv4} from 'uuid';
 import 'react-native-get-random-values';
 import {makePersistable} from 'mobx-persist-store';
 import * as RNFS from '@dr.pogodin/react-native-fs';
-import {computed, makeAutoObservable, runInAction} from 'mobx';
+import {computed, makeAutoObservable, runInAction, toJS} from 'mobx';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {LlamaContext, initLlama} from '@pocketpalai/llama.rn';
-import {CompletionParams} from '../utils/completionTypes';
+import {
+  CompletionParams,
+  toApiCompletionParams,
+} from '../utils/completionTypes';
 
 import {fetchModelFilesDetails} from '../api/hf';
 
 import {uiStore, hfStore} from '.';
 import {chatSessionStore} from './ChatSessionStore';
-import {deepMerge, getSHA256Hash, hfAsModel} from '../utils';
+import {
+  deepMerge,
+  getSHA256Hash,
+  hfAsModel,
+  getMmprojFiles,
+  filterProjectionModels,
+} from '../utils';
+import {getRecommendedProjectionModel} from '../utils/multimodalHelpers';
 import {defaultModels, MODEL_LIST_VERSION} from './defaultModels';
 
 import {downloadManager} from '../services/downloads';
@@ -36,13 +46,23 @@ import {
   Model,
   ModelFile,
   ModelOrigin,
+  ModelType,
 } from '../utils/types';
 
 import {ErrorState, createErrorState} from '../utils/errors';
+import {chatSessionRepository} from '../repositories/ChatSessionRepository';
+import {hasEnoughMemory, isHighEndDevice} from '../hooks/useMemoryCheck';
 
 class ModelStore {
   models: Model[] = [];
   version: number | undefined = undefined; // Persisted version
+
+  /**
+   * Returns models with projection models filtered out for display purposes
+   */
+  get displayModels(): Model[] {
+    return filterProjectionModels(this.models);
+  }
 
   appState: AppStateStatus = AppState.currentState;
   useAutoRelease: boolean = true;
@@ -59,6 +79,10 @@ class ModelStore {
   n_ubatch: number = 512;
 
   activeModelId: string | undefined = undefined;
+
+  // Flag to track if multimodal is currently active
+  isMultimodalActive: boolean = false;
+  activeProjectionModelId: string | undefined = undefined;
 
   // Track initialization settings for the active context
   activeContextSettings:
@@ -78,6 +102,13 @@ class ModelStore {
   useMetal = false; //Platform.OS === 'ios';
 
   lastUsedModelId: string | undefined = undefined;
+
+  // Auto-release tracking (persistent)
+  wasAutoReleased: boolean = false;
+  lastAutoReleasedModelId: string | undefined = undefined;
+
+  // System UI protection (runtime)
+  private autoReleaseDisabledReasons = new Set<string>();
 
   MIN_CONTEXT_SIZE = 200;
 
@@ -104,6 +135,9 @@ class ModelStore {
         'cache_type_v',
         'n_batch',
         'n_ubatch',
+        'lastUsedModelId',
+        'wasAutoReleased',
+        'lastAutoReleasedModelId',
       ],
       storage: AsyncStorage,
     }).then(() => {
@@ -263,6 +297,9 @@ class ModelStore {
     }
 
     this.initializeUseMetal();
+
+    // Check if we need to reload an auto-released model (for app restarts)
+    this.checkAndReloadAutoReleasedModel();
   };
 
   mergeModelLists = () => {
@@ -365,19 +402,80 @@ class ModelStore {
     AppState.addEventListener('change', this.handleAppStateChange);
   };
 
+  // Auto-release management methods
+  disableAutoRelease = (reason: string) => {
+    this.autoReleaseDisabledReasons.add(reason);
+    console.log(
+      `Auto-release disabled: ${reason}`,
+      Array.from(this.autoReleaseDisabledReasons),
+    );
+  };
+
+  enableAutoRelease = (reason: string) => {
+    this.autoReleaseDisabledReasons.delete(reason);
+    console.log(
+      `Auto-release enabled: ${reason}`,
+      Array.from(this.autoReleaseDisabledReasons),
+    );
+  };
+
+  get isAutoReleaseEnabled() {
+    return this.useAutoRelease && this.autoReleaseDisabledReasons.size === 0;
+  }
+
+  private markAutoReleased = (modelId: string) => {
+    console.log('Marking auto-released: ', modelId);
+    runInAction(() => {
+      this.wasAutoReleased = true;
+      this.lastAutoReleasedModelId = modelId;
+    });
+  };
+
+  private clearAutoReleaseFlags = () => {
+    console.log('Clearing auto-release flags');
+    runInAction(() => {
+      this.wasAutoReleased = false;
+      this.lastAutoReleasedModelId = undefined;
+    });
+  };
+
+  checkAndReloadAutoReleasedModel = async () => {
+    if (this.wasAutoReleased && this.lastAutoReleasedModelId) {
+      const model = this.models.find(
+        m => m.id === this.lastAutoReleasedModelId && m.isDownloaded,
+      );
+      if (model) {
+        console.log('Reloading auto-released model:', model.id);
+        await this.initContext(model);
+      }
+      this.clearAutoReleaseFlags();
+    }
+  };
+
   handleAppStateChange = async (nextAppState: AppStateStatus) => {
+    console.log(`App state change: ${this.appState} → ${nextAppState}`);
+
     if (
       this.appState.match(/inactive|background/) &&
       nextAppState === 'active'
     ) {
-      if (this.useAutoRelease) {
-        await this.reinitializeContext();
+      // Coming to foreground - check if we need to reload auto-released model
+      await this.checkAndReloadAutoReleasedModel();
+    } else if (this.appState === 'active' && nextAppState === 'inactive') {
+      // active → inactive: NO action (per requirements)
+      console.log('Active → Inactive: No auto-release action');
+    } else if (this.appState === 'inactive' && nextAppState === 'background') {
+      // inactive → background: release if enabled
+      if (this.isAutoReleaseEnabled && this.activeModelId) {
+        console.log('Inactive → Background: Auto-releasing context');
+        this.markAutoReleased(this.activeModelId);
+        await this.releaseContext();
       }
-    } else if (
-      this.appState === 'active' &&
-      nextAppState.match(/inactive|background/)
-    ) {
-      if (this.useAutoRelease) {
+    } else if (this.appState === 'active' && nextAppState === 'background') {
+      // active → background: release if enabled (direct transition)
+      if (this.isAutoReleaseEnabled && this.activeModelId) {
+        console.log('Active → Background: Auto-releasing context');
+        this.markAutoReleased(this.activeModelId);
         await this.releaseContext();
       }
     }
@@ -507,12 +605,61 @@ class ModelStore {
     });
   };
 
+  /**
+   * Private method to handle projection model download for vision models
+   * @param model The vision model that needs its projection model downloaded
+   */
+  private _downloadProjectionModelIfNeeded = async (model: Model) => {
+    // Only auto-download for vision models that aren't projection models themselves
+    if (
+      !model.supportsMultimodal ||
+      !model.defaultProjectionModel ||
+      model.modelType === ModelType.PROJECTION ||
+      !model.visionEnabled
+    ) {
+      return;
+    }
+
+    // Check if vision is enabled for this model
+    if (!this.getModelVisionPreference(model)) {
+      console.log(
+        'Vision disabled for model, skipping projection model download:',
+        model.id,
+      );
+      return;
+    }
+
+    const projModelId = model.defaultProjectionModel;
+    const projModel = this.models.find(m => m.id === projModelId);
+
+    if (
+      projModel &&
+      !projModel.isDownloaded &&
+      !downloadManager.isDownloading(projModelId)
+    ) {
+      console.log('Auto-downloading projection model for vision model:', {
+        llm: model.id,
+        projection: projModelId,
+      });
+
+      try {
+        // Download the projection model
+        await this.checkSpaceAndDownload(projModelId);
+      } catch (error) {
+        console.error('Failed to auto-download projection model:', error);
+        // Don't re-throw - projection model download failure shouldn't fail the main model download
+        // The user can manually download the projection model later if needed
+      }
+    }
+  };
+
   checkSpaceAndDownload = async (modelId: string) => {
     const model = this.models.find(m => m.id === modelId);
-    // Skip if model is undefined, local or doesn't have a download URL
+    // Skip if model is undefined, already downloaded, local or doesn't have a download URL
     // TODO: we need a better way to handle this. Why this could ever happen?
     if (
       !model ||
+      model.isDownloaded ||
       model.isLocal ||
       model.origin === ModelOrigin.LOCAL ||
       !model.downloadUrl
@@ -524,9 +671,23 @@ class ModelStore {
       const destinationPath = await this.getModelFullPath(model);
       const authToken = hfStore.shouldUseToken ? hfStore.hfToken : null;
       await downloadManager.startDownload(model, destinationPath, authToken);
+
+      // For vision models, automatically download the projection model
+      await this._downloadProjectionModelIfNeeded(model);
     } catch (err) {
       console.error('Failed to start download:', err);
-      uiStore.showError('Failed to start download: ' + (err as Error).message);
+
+      // Create proper error state for the snackbar system
+      const errorState = createErrorState(err, 'download', 'huggingface', {
+        modelId,
+      });
+
+      runInAction(() => {
+        this.downloadError = errorState;
+      });
+
+      // Re-throw so the caller knows the download failed
+      throw err;
     }
   };
 
@@ -581,15 +742,63 @@ class ModelStore {
     }
     const _model = this.models[modelIndex];
 
+    // Special handling for projection models
+    if (_model.modelType === ModelType.PROJECTION) {
+      const canDeleteResult = this.canDeleteProjectionModel(_model.id);
+      if (!canDeleteResult.canDelete) {
+        throw new Error(
+          canDeleteResult.reason || 'Cannot delete projection model',
+        );
+      }
+
+      // Disable vision for dependent models when their projection model is deleted
+      if (
+        canDeleteResult.dependentModels &&
+        canDeleteResult.dependentModels.length > 0
+      ) {
+        // Use Promise.allSettled to handle potential errors gracefully
+        await Promise.allSettled(
+          canDeleteResult.dependentModels.map(dependentModel =>
+            this.setModelVisionEnabled(dependentModel.id, false),
+          ),
+        );
+      }
+    }
+
+    // Store all projection model IDs that this LLM could use
+    const projectionModelIds: string[] = [];
+    if (_model.supportsMultimodal) {
+      // Add the default projection model
+      if (_model.defaultProjectionModel) {
+        projectionModelIds.push(_model.defaultProjectionModel);
+      }
+      // Add all compatible projection models (in case user downloaded additional ones)
+      if (_model.compatibleProjectionModels) {
+        _model.compatibleProjectionModels.forEach(id => {
+          if (!projectionModelIds.includes(id)) {
+            projectionModelIds.push(id);
+          }
+        });
+      }
+    }
+
     const filePath = await this.getModelFullPath(_model);
     if (_model.isLocal || _model.origin === ModelOrigin.LOCAL) {
       // Local models are always removed from the list, when the file is deleted.
+
+      // Check if we need to release context (if this model is currently active)
+      const needsContextRelease = this.activeModelId === _model.id;
+
+      // Remove model from list first
       runInAction(() => {
         this.models.splice(modelIndex, 1);
-        if (this.activeModelId === _model.id) {
-          this.releaseContext();
-        }
       });
+
+      // Release context if needed - this will handle all state cleanup
+      if (needsContextRelease) {
+        await this.releaseContext(true); // Clear active model and all related state
+      }
+
       // Delete the file from internal storage
       try {
         await RNFS.unlink(filePath);
@@ -603,13 +812,21 @@ class ModelStore {
       try {
         if (filePath) {
           await RNFS.unlink(filePath);
+
+          // Check if we need to release context (if this model is currently active)
+          const needsContextRelease = this.activeModelId === _model.id;
+
+          // Update model state first
           runInAction(() => {
             _model.progress = 0;
-            if (this.activeModelId === _model.id) {
-              this.releaseContext();
-              this.activeModelId = undefined;
-            }
+            _model.isDownloaded = false; // Mark as not downloaded after successful deletion
           });
+
+          // Release context if needed - this will handle all state cleanup
+          if (needsContextRelease) {
+            await this.releaseContext(true); // Clear active model and all related state
+          }
+
           //console.log('models: ', this.models);
         } else {
           console.error("Failed to delete, file doesn't exist: ", filePath);
@@ -619,18 +836,152 @@ class ModelStore {
         console.error('Failed to delete:', err);
       }
     }
+
+    // After deleting an LLM, check if any of its projection models have become orphaned
+    if (
+      projectionModelIds.length > 0 &&
+      _model.modelType !== ModelType.PROJECTION
+    ) {
+      await this.cleanupOrphanedProjectionModels(projectionModelIds);
+    }
   };
 
-  initContext = async (model: Model) => {
+  /**
+   * Initialize a model context, optionally with multimodal support
+   * @param model The main LLM model to initialize
+   * @param mmProjPath Optional path to a projection model for multimodal support
+   * @returns The initialized LlamaContext
+   */
+  initContext = async (model: Model, mmProjPath?: string) => {
     await this.releaseContext();
     const filePath = await this.getModelFullPath(model);
     if (!filePath) {
       throw new Error('Model path is undefined');
     }
+
+    // Determine if this is a multimodal initialization
+    let isMultimodalInit = false;
+    let projectionModel: Model | undefined;
+
+    // Check if vision is enabled for this model
+    const visionEnabled = this.getModelVisionPreference(model);
+
+    // If mmProjPath is provided directly, use it (but only if vision is enabled)
+    if (mmProjPath && visionEnabled) {
+      isMultimodalInit = true;
+    }
+    // Otherwise, check if the model has a default projection model and vision is enabled
+    else if (
+      model.supportsMultimodal &&
+      model.defaultProjectionModel &&
+      visionEnabled
+    ) {
+      projectionModel = this.models.find(
+        m => m.id === model.defaultProjectionModel,
+      );
+      if (projectionModel?.isDownloaded) {
+        mmProjPath = await this.getModelFullPath(projectionModel);
+        isMultimodalInit = true;
+      }
+    }
+
+    // Check both memory and device capability for models
+    let hasMemory = true;
+    try {
+      hasMemory = await hasEnoughMemory(model.size, isMultimodalInit);
+    } catch (error) {
+      console.error('Memory check failed:', error);
+      return null;
+    }
+    const isCapable = isMultimodalInit ? await isHighEndDevice() : true;
+
+    // Determine what warnings to show
+    const hasMemoryIssue = !hasMemory;
+    const hasCapabilityIssue = isMultimodalInit && !isCapable;
+
+    if (hasMemoryIssue || hasCapabilityIssue) {
+      console.warn(
+        `Device performance warning for model: ${model.name} - Memory: ${hasMemoryIssue}, Capability: ${hasCapabilityIssue}`,
+      );
+
+      // Determine appropriate alert message
+      let title: string;
+      let message: string;
+
+      if (hasMemoryIssue && hasCapabilityIssue) {
+        // Both memory and multimodal capability issues
+        title = uiStore.l10n.memory.alerts.combinedWarningTitle;
+        message = uiStore.l10n.memory.alerts.combinedWarningMessage;
+      } else if (hasMemoryIssue) {
+        // Only memory issue
+        title = uiStore.l10n.memory.alerts.memoryWarningTitle;
+        message = uiStore.l10n.memory.alerts.memoryWarningMessage;
+      } else {
+        // Only multimodal capability issue
+        title = uiStore.l10n.memory.alerts.multimodalWarningTitle;
+        message = uiStore.l10n.memory.alerts.multimodalWarningMessage;
+      }
+
+      // Show alert and let user decide
+      return new Promise((resolve, reject) => {
+        Alert.alert(title, message, [
+          {
+            text: uiStore.l10n.memory.alerts.cancel,
+            style: 'cancel',
+            onPress: () => {
+              reject(new Error('Model loading cancelled by user'));
+            },
+          },
+          {
+            text: uiStore.l10n.memory.alerts.continue,
+            onPress: async () => {
+              try {
+                const ctx = await this.proceedWithInitialization(
+                  model,
+                  mmProjPath,
+                  isMultimodalInit,
+                  projectionModel,
+                );
+                resolve(ctx);
+              } catch (error) {
+                reject(error);
+              }
+            },
+          },
+        ]);
+      });
+    }
+
+    // If device is capable or not multimodal, proceed with normal initialization
+    return this.proceedWithInitialization(
+      model,
+      mmProjPath,
+      isMultimodalInit,
+      projectionModel,
+    );
+  };
+
+  /**
+   * Proceed with the actual model initialization after device capability checks
+   */
+  private async proceedWithInitialization(
+    model: Model,
+    mmProjPath?: string,
+    isMultimodalInit: boolean = false,
+    projectionModel?: Model,
+  ): Promise<LlamaContext> {
+    const filePath = await this.getModelFullPath(model);
+    if (!filePath) {
+      throw new Error('Model path is undefined');
+    }
+
     runInAction(() => {
       this.isContextLoading = true;
       this.loadingModel = model;
+      this.isMultimodalActive = false; // Reset until we confirm it's enabled
+      this.activeProjectionModelId = projectionModel?.id;
     });
+
     try {
       const effectiveValues = this.getEffectiveValues();
       const initSettings = {
@@ -644,6 +995,7 @@ class ModelStore {
         n_gpu_layers: this.useMetal ? this.n_gpu_layers : 0,
         no_gpu_devices: !this.useMetal,
       };
+
       const ctx = await initLlama(
         {
           model: filePath,
@@ -658,6 +1010,39 @@ class ModelStore {
 
       await this.updateModelStopTokens(ctx, model);
 
+      // Initialize multimodal support if mmproj path was provided
+      if (isMultimodalInit && mmProjPath) {
+        try {
+          console.log('Initializing multimodal support with path:', mmProjPath);
+
+          // Initialize multimodal with the new API format
+          const success = await ctx.initMultimodal({
+            path: mmProjPath,
+            use_gpu: this.useMetal,
+          });
+
+          if (!success) {
+            console.error('Failed to initialize multimodal support');
+          } else {
+            console.log('Multimodal support initialized successfully');
+            // Verify that multimodal is now enabled
+            const isEnabled = await ctx.isMultimodalEnabled();
+            console.log('Multimodal enabled status:', isEnabled);
+
+            // Update the multimodal active flag
+            runInAction(() => {
+              this.isMultimodalActive = isEnabled;
+            });
+          }
+        } catch (error) {
+          console.error('Error initializing multimodal support:', error);
+          runInAction(() => {
+            this.isMultimodalActive = false;
+            this.activeProjectionModelId = undefined;
+          });
+        }
+      }
+
       runInAction(() => {
         this.context = ctx;
         this.activeContextSettings = initSettings;
@@ -671,29 +1056,69 @@ class ModelStore {
         this.lastUsedModelId = model.id;
       });
     }
-  };
+  }
 
-  releaseContext = async () => {
+  releaseContext = async (clearActiveModel: boolean = false) => {
     console.log('attempt to release');
     chatSessionStore.exitEditMode();
     if (!this.context) {
+      // Even if no context exists, clear state if requested (for deletion scenarios)
+      if (clearActiveModel) {
+        runInAction(() => {
+          this.activeModelId = undefined;
+          this.isMultimodalActive = false;
+          this.activeProjectionModelId = undefined;
+        });
+      }
       return Promise.resolve('No context to release');
     }
-    await this.context.release();
-    console.log('released');
-    runInAction(() => {
-      this.context = undefined;
-      this.activeContextSettings = undefined;
-      //this.activeModelId = undefined; // activeModelId is set to undefined in manualReleaseContext
-    });
+
+    try {
+      // First check if multimodal is enabled and release it if needed
+      const isMultimodalEnabled = await this.isMultimodalEnabled();
+      if (isMultimodalEnabled) {
+        console.log('Releasing multimodal context first');
+        try {
+          await this.context.releaseMultimodal();
+          // Immediately clear multimodal state after successful release
+          runInAction(() => {
+            this.isMultimodalActive = false;
+            this.activeProjectionModelId = undefined;
+          });
+          console.log('Multimodal context released and state cleared');
+        } catch (error) {
+          console.error('Error releasing multimodal context:', error);
+          // Even if release fails, clear the state to prevent blocking deletion
+          runInAction(() => {
+            this.isMultimodalActive = false;
+            this.activeProjectionModelId = undefined;
+          });
+        }
+      }
+
+      // Then release the main context
+      await this.context.release();
+      console.log('released');
+    } catch (error) {
+      console.error('Error during context release:', error);
+    } finally {
+      runInAction(() => {
+        this.context = undefined;
+        this.activeContextSettings = undefined;
+        // Ensure multimodal state is cleared even if something went wrong above
+        this.isMultimodalActive = false;
+        this.activeProjectionModelId = undefined;
+        // Clear active model if requested (for deletion scenarios)
+        if (clearActiveModel) {
+          this.activeModelId = undefined;
+        }
+      });
+    }
     return 'Context released successfully';
   };
 
   manualReleaseContext = async () => {
-    await this.releaseContext();
-    runInAction(() => {
-      this.activeModelId = undefined;
-    });
+    await this.releaseContext(true); // Clear active model for manual release
   };
 
   get activeModel(): Model | undefined {
@@ -710,10 +1135,55 @@ class ModelStore {
     this.activeModelId = modelId;
   }
 
-  downloadHFModel = async (hfModel: HuggingFaceModel, modelFile: ModelFile) => {
+  downloadHFModel = async (
+    hfModel: HuggingFaceModel,
+    modelFile: ModelFile,
+    options?: {
+      enableVision?: boolean;
+      projectionModelId?: string; // User-selected projection model
+    },
+  ) => {
     try {
       const newModel = await this.addHFModel(hfModel, modelFile);
-      await this.checkSpaceAndDownload(newModel.id);
+      if (!newModel) {
+        throw new Error('Failed to add model to store');
+      }
+
+      // Set vision preference based on user choice
+      if (newModel.supportsMultimodal && options?.enableVision !== undefined) {
+        this.setModelVisionEnabled(newModel.id, options.enableVision);
+        // runInAction(() => {
+        //   newModel.visionEnabled = options.enableVision;
+        // });
+      }
+
+      // Override default projection model with user selection if provided
+      if (newModel.supportsMultimodal && options?.projectionModelId) {
+        // Validate that selected projection model exists in repository
+        const mmprojFiles = getMmprojFiles(hfModel.siblings || []);
+        const selectedExists = mmprojFiles.some(
+          file =>
+            `${hfModel.id}/${file.rfilename}` === options.projectionModelId,
+        );
+
+        if (selectedExists) {
+          runInAction(() => {
+            newModel.defaultProjectionModel = options.projectionModelId;
+          });
+        } else {
+          console.warn(
+            'Selected projection model not found in repository, using auto-determined default',
+          );
+        }
+      }
+
+      // Wait a bit to ensure the projection model is added to the store
+      // This is needed because addHFModel adds mmproj models asynchronously
+      await new Promise(resolve => setTimeout(resolve, 200));
+
+      // Use the centralized download method which handles mmproj automatically
+      this.checkSpaceAndDownload(newModel.id);
+
       // The error handling is now done in the downloadManager callbacks
     } catch (error) {
       // Only handle errors related to the initial setup before the download starts
@@ -730,6 +1200,7 @@ class ModelStore {
 
   /**
    * Adds a new HF model to the models list, only if it doesn't exist yet.
+   * For multimodal models, ensures all required projection models are also added.
    * @param hfModel - The Hugging Face model to add.
    * @param modelFile - The model file to add.
    * @returns The new model that was added.
@@ -737,15 +1208,106 @@ class ModelStore {
   addHFModel = async (hfModel: HuggingFaceModel, modelFile: ModelFile) => {
     const newModel = hfAsModel(hfModel, modelFile);
     const storeModel = this.models.find(m => m.id === newModel.id);
-    if (storeModel) {
-      // Model already exists, return the existing model
+
+    // For non-multimodal models, return early if the model already exists
+    if (storeModel && !newModel.supportsMultimodal) {
       return storeModel;
     }
-    runInAction(() => {
-      this.models.push(newModel);
-    });
+
+    // Add the model to the store if it doesn't exist
+    let modelToReturn = storeModel;
+    if (!storeModel) {
+      runInAction(() => {
+        this.models.push(newModel);
+      });
+      modelToReturn = newModel;
+    }
+
+    // For multimodal models, always ensure projection models are in the store
+    if (
+      newModel.supportsMultimodal &&
+      newModel.compatibleProjectionModels?.length
+    ) {
+      // Get the mmproj files from the repository
+      const mmprojFiles = getMmprojFiles(hfModel.siblings || []);
+
+      // Add each projection model to the store if it doesn't exist
+      for (const mmprojFile of mmprojFiles) {
+        const projModelId = `${hfModel.id}/${mmprojFile.rfilename}`;
+        const existingProjModel = this.models.find(m => m.id === projModelId);
+
+        if (!existingProjModel) {
+          // Create and add the projection model
+          const projModel = hfAsModel(hfModel, mmprojFile);
+          runInAction(() => {
+            this.models.push(projModel);
+          });
+        }
+      }
+
+      // If we're working with an existing model, update its projection model references
+      // to ensure they're current with what's now in the store
+      if (storeModel) {
+        const updatedCompatibleModels = mmprojFiles.map(
+          file => `${hfModel.id}/${file.rfilename}`,
+        );
+
+        runInAction(() => {
+          // Update compatible projection models list
+          storeModel.compatibleProjectionModels = updatedCompatibleModels;
+
+          // Ensure default projection model is set if not already set
+          if (
+            !storeModel.defaultProjectionModel &&
+            updatedCompatibleModels.length > 0
+          ) {
+            // Use the same logic as hfAsModel to determine the default
+            const mmprojFilenames = mmprojFiles.map(file => file.rfilename);
+            const recommendedFile = getRecommendedProjectionModel(
+              modelFile.rfilename,
+              mmprojFilenames,
+            );
+            if (recommendedFile) {
+              storeModel.defaultProjectionModel = `${hfModel.id}/${recommendedFile}`;
+            }
+          }
+        });
+      }
+    }
+
+    // If this is a projection model, check if we need to update any vision models
+    if (newModel.modelType === ModelType.PROJECTION) {
+      // Get the repository ID from the model ID
+      const repoId = newModel.id.split('/').slice(0, 2).join('/');
+
+      // Find vision models from the same repository
+      const visionModels = this.models.filter(
+        m =>
+          m.supportsMultimodal &&
+          m.id.startsWith(repoId) &&
+          m.id !== newModel.id,
+      );
+
+      // Update the compatible projection models for each vision model
+      for (const visionModel of visionModels) {
+        if (!visionModel.compatibleProjectionModels?.includes(newModel.id)) {
+          runInAction(() => {
+            if (!visionModel.compatibleProjectionModels) {
+              visionModel.compatibleProjectionModels = [];
+            }
+            visionModel.compatibleProjectionModels.push(newModel.id);
+
+            // If no default projection model is set, set this one as default
+            if (!visionModel.defaultProjectionModel) {
+              visionModel.defaultProjectionModel = newModel.id;
+            }
+          });
+        }
+      }
+    }
+
     await this.refreshDownloadStatuses();
-    return newModel;
+    return modelToReturn;
   };
 
   addLocalModel = async (localFilePath: string) => {
@@ -768,7 +1330,7 @@ class ModelStore {
       progress: 0,
       filename,
       fullPath: localFilePath,
-      isLocal: true,
+      isLocal: true, // Kept for backward compatibility
       origin: ModelOrigin.LOCAL,
       defaultChatTemplate: {...defaultSettings.chatTemplate},
       chatTemplate: {...defaultSettings.chatTemplate},
@@ -959,13 +1521,18 @@ class ModelStore {
     }
   }
 
+  /**
+   * Returns available (i.e. downloaded models) models with projection models filtered out
+   */
   get availableModels(): Model[] {
-    return this.models.filter(
-      model =>
-        // Include models that are either local or downloaded
-        model.isLocal ||
-        model.origin === ModelOrigin.LOCAL ||
-        model.isDownloaded,
+    return filterProjectionModels(
+      this.models.filter(
+        model =>
+          // Include models that are either local or downloaded
+          model.isLocal ||
+          model.origin === ModelOrigin.LOCAL ||
+          model.isDownloaded,
+      ),
     );
   }
 
@@ -976,6 +1543,509 @@ class ModelStore {
   setIsStreaming(value: boolean) {
     this.isStreaming = value;
   }
+
+  /**
+   * Checks if the current context supports multimodal input
+   * @returns Promise<boolean> - True if multimodal is enabled, false otherwise
+   */
+  isMultimodalEnabled = async (): Promise<boolean> => {
+    // First check our cached flag for quick responses
+    if (this.isMultimodalActive) {
+      return true;
+    }
+
+    // If not active, check with the context
+    if (!this.context) {
+      console.log('isMultimodalEnabled: No context available');
+      return false;
+    }
+
+    try {
+      const isEnabled = await this.context.isMultimodalEnabled();
+
+      // Update our cached flag
+      if (isEnabled !== this.isMultimodalActive) {
+        runInAction(() => {
+          this.isMultimodalActive = isEnabled;
+        });
+      }
+
+      return isEnabled;
+    } catch (error) {
+      console.error('Error checking multimodal capability:', error);
+      return false;
+    }
+  };
+
+  /**
+   * Get compatible projection models for a given LLM
+   * @param modelId The ID of the LLM model
+   * @returns Array of compatible projection models
+   */
+  getCompatibleProjectionModels = (modelId: string): Model[] => {
+    const model = this.models.find(m => m.id === modelId);
+    if (!model || !model.supportsMultimodal) {
+      return [];
+    }
+
+    // If the model has explicitly defined compatible projection models, use those
+    if (
+      model.compatibleProjectionModels &&
+      model.compatibleProjectionModels.length > 0
+    ) {
+      return this.models.filter(
+        m =>
+          m.modelType === ModelType.PROJECTION &&
+          model.compatibleProjectionModels?.includes(m.id),
+      );
+    }
+
+    // Otherwise, try to find projection models from the same repository
+    const modelIdParts = model.id.split('/');
+    if (modelIdParts.length >= 2) {
+      const author = modelIdParts[0];
+      const repo = modelIdParts[1];
+
+      return this.models.filter(
+        m =>
+          m.modelType === ModelType.PROJECTION &&
+          m.id.startsWith(`${author}/${repo}/`),
+      );
+    }
+
+    return [];
+  };
+
+  /**
+   * Set default projection model for an LLM
+   * @param modelId The ID of the LLM model
+   * @param projectionModelId The ID of the projection model to set as default
+   */
+  setDefaultProjectionModel = (modelId: string, projectionModelId: string) => {
+    const model = this.models.find(m => m.id === modelId);
+    if (model && model.supportsMultimodal) {
+      runInAction(() => {
+        model.defaultProjectionModel = projectionModelId;
+      });
+    }
+  };
+
+  /**
+   * Get the default projection model for an LLM
+   * @param modelId The ID of the LLM model
+   * @returns The default projection model, or undefined if none is set
+   */
+  getDefaultProjectionModel = (modelId: string): Model | undefined => {
+    const model = this.models.find(m => m.id === modelId);
+    if (!model || !model.supportsMultimodal || !model.defaultProjectionModel) {
+      return undefined;
+    }
+
+    return this.models.find(m => m.id === model.defaultProjectionModel);
+  };
+
+  /**
+   * Get all LLM models that use a specific projection model as their default
+   * @param projectionModelId The ID of the projection model
+   * @returns Array of LLM models that use this projection model as default
+   */
+  getLLMsUsingProjectionModel = (projectionModelId: string): Model[] => {
+    return this.models.filter(
+      m =>
+        m.supportsMultimodal &&
+        m.defaultProjectionModel === projectionModelId &&
+        m.modelType !== ModelType.PROJECTION,
+    );
+  };
+
+  /**
+   * Get all downloaded LLM models that use a specific projection model as their default
+   * @param projectionModelId The ID of the projection model
+   * @returns Array of downloaded LLM models that use this projection model as default
+   */
+  getDownloadedLLMsUsingProjectionModel = (
+    projectionModelId: string,
+  ): Model[] => {
+    return this.getLLMsUsingProjectionModel(projectionModelId).filter(
+      m => m.isDownloaded,
+    );
+  };
+
+  /**
+   * Check if a vision model has its required projection model downloaded
+   * @param model The vision model to check
+   * @returns true if the model doesn't need a projection model or if it has one downloaded
+   */
+  hasRequiredProjectionModel = (model: Model): boolean => {
+    const status = this.getProjectionModelStatus(model);
+    return status.isAvailable;
+  };
+
+  /**
+   * Get detailed status of a vision model's projection model
+   * @param model The vision model to check
+   * @returns Object with availability status and detailed state information
+   */
+  getProjectionModelStatus = (
+    model: Model,
+  ): {
+    isAvailable: boolean;
+    state: 'not_needed' | 'downloaded' | 'downloading' | 'missing';
+    projectionModel?: Model;
+  } => {
+    // Non-multimodal models don't need projection models
+    if (!model.supportsMultimodal || !model.defaultProjectionModel) {
+      return {
+        isAvailable: true,
+        state: 'not_needed',
+      };
+    }
+
+    // Find the projection model
+    const projectionModel = this.models.find(
+      m => m.id === model.defaultProjectionModel,
+    );
+
+    if (!projectionModel) {
+      return {
+        isAvailable: false,
+        state: 'missing',
+      };
+    }
+
+    // Check if projection model is downloaded
+    if (projectionModel.isDownloaded) {
+      return {
+        isAvailable: true,
+        state: 'downloaded',
+        projectionModel,
+      };
+    }
+
+    // Check if projection model is currently downloading
+    if (downloadManager.isDownloading(projectionModel.id)) {
+      return {
+        isAvailable: true, // Consider it available during download
+        state: 'downloading',
+        projectionModel,
+      };
+    }
+
+    // Projection model exists but is not downloaded and not downloading
+    return {
+      isAvailable: false,
+      state: 'missing',
+      projectionModel,
+    };
+  };
+
+  /**
+   * Check if a projection model can be safely deleted
+   * @param projectionModelId The ID of the projection model to check
+   * @returns Object with canDelete flag and reason if deletion is blocked
+   */
+  canDeleteProjectionModel = (
+    projectionModelId: string,
+  ): {canDelete: boolean; reason?: string; dependentModels?: Model[]} => {
+    const projectionModel = this.models.find(m => m.id === projectionModelId);
+
+    if (
+      !projectionModel ||
+      projectionModel.modelType !== ModelType.PROJECTION
+    ) {
+      return {
+        canDelete: false,
+        reason: 'Model not found or not a projection model',
+      };
+    }
+
+    // Check if it's currently active - but also verify that we actually have a context
+    // This prevents false positives when the context has been released but state hasn't updated
+    if (this.activeProjectionModelId === projectionModelId) {
+      // Double-check: if we don't have an active context, the projection model isn't really active
+      if (!this.context) {
+        console.log(
+          'Projection model marked as active but no context exists, allowing deletion:',
+          projectionModelId,
+        );
+      } else {
+        return {
+          canDelete: false,
+          reason: 'Projection model is currently active',
+        };
+      }
+    }
+
+    // Get dependent models for warning purposes
+    const dependentModels =
+      this.getDownloadedLLMsUsingProjectionModel(projectionModelId);
+
+    if (dependentModels.length > 0) {
+      console.log(
+        'Projection model is used by downloaded LLM models:',
+        dependentModels.map(m => m.id),
+      );
+
+      // Return true to allow manual deletion with warning
+      // Automatic cleanup will check dependencies separately
+      return {
+        canDelete: true,
+        reason: 'Projection model is used by downloaded LLM models',
+        dependentModels,
+      };
+    }
+
+    return {canDelete: true, dependentModels};
+  };
+
+  /**
+   * Automatically cleanup orphaned projection models
+   * @param projectionModelId The ID of the projection model to check for cleanup
+   */
+  cleanupOrphanedProjectionModel = async (projectionModelId: string) => {
+    const projectionModel = this.models.find(m => m.id === projectionModelId);
+
+    if (
+      !projectionModel ||
+      projectionModel.modelType !== ModelType.PROJECTION
+    ) {
+      return; // Not a projection model, nothing to cleanup
+    }
+
+    if (!projectionModel.isDownloaded) {
+      return; // Not downloaded, nothing to cleanup
+    }
+
+    // For automatic cleanup, check if there are any dependent models
+    const dependentModels =
+      this.getDownloadedLLMsUsingProjectionModel(projectionModelId);
+
+    if (dependentModels.length > 0) {
+      console.log(
+        'Skipping auto-cleanup of projection model - still used by downloaded LLMs:',
+        dependentModels.map(m => m.id),
+      );
+      return;
+    }
+
+    console.log(
+      'Auto-cleaning up orphaned projection model:',
+      projectionModelId,
+    );
+    try {
+      await this.deleteModel(projectionModel);
+    } catch (error) {
+      console.error('Failed to auto-cleanup orphaned projection model:', error);
+    }
+  };
+
+  /**
+   * Automatically cleanup multiple orphaned projection models
+   * @param projectionModelIds Array of projection model IDs to check for cleanup
+   */
+  cleanupOrphanedProjectionModels = async (projectionModelIds: string[]) => {
+    console.log('Checking for orphaned projection models:', projectionModelIds);
+
+    // Process each projection model for potential cleanup
+    for (const projectionModelId of projectionModelIds) {
+      await this.cleanupOrphanedProjectionModel(projectionModelId);
+    }
+  };
+
+  /**
+   * Set vision preference for a model
+   * @param modelId The ID of the model
+   * @param enabled Whether vision capabilities should be enabled
+   */
+  setModelVisionEnabled = async (modelId: string, enabled: boolean) => {
+    const model = this.models.find(m => m.id === modelId);
+    if (!model || !model.supportsMultimodal) {
+      return;
+    }
+
+    // Store the previous vision state to detect changes
+    const previousVisionEnabled = this.getModelVisionPreference(model);
+
+    runInAction(() => {
+      model.visionEnabled = enabled;
+    });
+
+    // Check if this model is currently active and if vision state actually changed
+    const isActiveModel = this.activeModelId === modelId;
+    const visionStateChanged = previousVisionEnabled !== enabled;
+
+    if (isActiveModel && visionStateChanged && this.context) {
+      console.log(
+        `Vision ${
+          enabled ? 'enabled' : 'disabled'
+        } for active model, reloading context`,
+        {
+          modelId,
+          previousState: previousVisionEnabled,
+          newState: enabled,
+          isMultimodalActive: this.isMultimodalActive,
+        },
+      );
+
+      try {
+        // Reload the context with the new vision setting
+        await this.initContext(model);
+      } catch (error) {
+        console.error(
+          'Failed to reload context after vision state change:',
+          error,
+        );
+
+        // Revert the vision setting if context reload failed
+        runInAction(() => {
+          model.visionEnabled = previousVisionEnabled;
+        });
+
+        // Re-throw the error so the UI can handle it appropriately
+        throw error;
+      }
+    }
+  };
+
+  /**
+   * Get vision preference for a model
+   * @param model The model to check
+   * @returns true if vision should be enabled (defaults to true for backward compatibility)
+   */
+  getModelVisionPreference = (model: Model): boolean => {
+    // For non-multimodal models, always return false
+    if (!model.supportsMultimodal) {
+      return false;
+    }
+
+    // Default to true for backward compatibility if not explicitly set
+    return model.visionEnabled !== false;
+  };
+
+  /**
+   * Starts a completion with one or more images
+   * @param params - Completion parameters including image paths
+   * @returns Promise<void>
+   */
+  startImageCompletion = async (params: {
+    prompt: string;
+    image_path?: string; // For backward compatibility
+    image_paths?: string[]; // New parameter for multiple images
+    systemMessage?: string;
+    onToken?: (token: string) => void;
+    onComplete?: (text: string) => void;
+    onError?: (error: Error) => void;
+  }): Promise<void> => {
+    if (!this.context) {
+      throw new Error('No model context available');
+    }
+
+    // Check if multimodal is enabled
+    const isMultimodalEnabled = await this.isMultimodalEnabled();
+    if (!isMultimodalEnabled) {
+      throw new Error('Multimodal is not enabled for this model');
+    }
+
+    runInAction(() => {
+      this.inferencing = true;
+      this.isStreaming = false;
+    });
+
+    try {
+      // Handle both single image_path and multiple image_paths
+      let imagePaths: string[] = [];
+
+      if (params.image_paths && params.image_paths.length > 0) {
+        // Use the provided image_paths array
+        imagePaths = [...params.image_paths];
+      } else if (params.image_path) {
+        // Backward compatibility: convert single image_path to array
+        imagePaths = [params.image_path];
+      }
+
+      if (imagePaths.length === 0) {
+        throw new Error('No images provided for multimodal completion');
+      }
+
+      // Process all image paths to handle file:// prefix
+      const processedImagePaths = imagePaths.map(path =>
+        path.startsWith('file://')
+          ? Platform.OS === 'ios'
+            ? path.substring(7) // iOS: remove 'file://'
+            : path // Android: keep as is
+          : path,
+      );
+
+      // Create a system message if provided
+      const systemMessage = params.systemMessage?.trim()
+        ? {
+            role: 'system',
+            content: params.systemMessage,
+          }
+        : undefined;
+
+      // Create a user message with text and all images
+      const userMessage = {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: params.prompt,
+          },
+          // Add all images to the content array
+          ...processedImagePaths.map(path => ({
+            type: 'image_url',
+            image_url: {url: path},
+          })),
+        ],
+      };
+
+      // Start the completion
+      runInAction(() => {
+        this.isStreaming = true;
+      });
+
+      const completionParams =
+        await chatSessionRepository.getGlobalCompletionSettings();
+      const stopWords = toJS(modelStore.activeModel?.stopWords);
+
+      // Create completion params with app-specific properties
+      const messages = systemMessage
+        ? [systemMessage, userMessage]
+        : [userMessage];
+      const completionParamsWithAppProps = {
+        ...completionParams,
+        messages: messages,
+        stop: stopWords,
+      } as CompletionParams;
+
+      // Strip app-specific properties before passing to llama.rn
+      const cleanCompletionParams = toApiCompletionParams(
+        completionParamsWithAppProps,
+      );
+
+      const result = await this.context.completion(
+        cleanCompletionParams,
+        data => {
+          if (data.token) {
+            params.onToken?.(data.token);
+          }
+        },
+      );
+
+      params.onComplete?.(result.text);
+    } catch (error) {
+      console.error('Error in multi-image completion:', error);
+      params.onError?.(
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    } finally {
+      runInAction(() => {
+        this.inferencing = false;
+        this.isStreaming = false;
+      });
+    }
+  };
 
   /**
    * Fetches and updates model file details from HuggingFace.

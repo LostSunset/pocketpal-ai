@@ -3,6 +3,9 @@ import {renderHook} from '@testing-library/react-hooks';
 
 import {largeMemoryModel, localModel} from '../../../jest/fixtures/models';
 
+// Unmock the hook for actual testing
+jest.unmock('../useMemoryCheck');
+
 import {useMemoryCheck} from '../useMemoryCheck';
 
 import {l10n} from '../../utils/l10n';
@@ -18,7 +21,7 @@ describe('useMemoryCheck', () => {
 
   it('returns no warning when model size is within safe memory limits', async () => {
     const {result, waitForNextUpdate} = renderHook(() =>
-      useMemoryCheck(localModel),
+      useMemoryCheck(localModel.size),
     );
 
     try {
@@ -30,12 +33,13 @@ describe('useMemoryCheck', () => {
     expect(result.current).toEqual({
       memoryWarning: '',
       shortMemoryWarning: '',
+      multimodalWarning: '',
     });
   });
 
   it('returns memory warning when model size exceeds safe memory limits', async () => {
     const {result, waitForNextUpdate} = renderHook(() =>
-      useMemoryCheck(largeMemoryModel),
+      useMemoryCheck(largeMemoryModel.size),
     );
 
     try {
@@ -47,6 +51,7 @@ describe('useMemoryCheck', () => {
     expect(result.current).toEqual({
       memoryWarning: l10n.en.memory.warning,
       shortMemoryWarning: l10n.en.memory.shortWarning,
+      multimodalWarning: '',
     });
   });
 
@@ -61,7 +66,7 @@ describe('useMemoryCheck', () => {
       .mockImplementation(() => {});
 
     const {result, waitForNextUpdate} = renderHook(() =>
-      useMemoryCheck(largeMemoryModel),
+      useMemoryCheck(largeMemoryModel.size),
     );
 
     try {
@@ -74,6 +79,7 @@ describe('useMemoryCheck', () => {
     expect(result.current).toEqual({
       memoryWarning: '',
       shortMemoryWarning: '',
+      multimodalWarning: '',
     });
 
     // Ensure the error is logged. TODO: check if there is a better way.

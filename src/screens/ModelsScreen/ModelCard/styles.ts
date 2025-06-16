@@ -86,23 +86,6 @@ export const createStyles = (theme: Theme) =>
       marginVertical: 4,
       color: theme.colors.onSurfaceVariant,
     },
-    skillsLabel: {
-      fontSize: 12,
-      fontWeight: 'bold',
-      color: theme.colors.primary,
-      marginRight: 4,
-    },
-    skillsText: {
-      fontSize: 12,
-      color: theme.colors.onSurfaceVariant,
-      flexShrink: 1,
-    },
-    skillsContainer: {
-      marginTop: 4,
-      flexDirection: 'row',
-      flexWrap: 'wrap',
-      alignItems: 'flex-start',
-    },
     hfButton: {
       margin: 0,
       padding: 0,
@@ -160,5 +143,12 @@ export const createStyles = (theme: Theme) =>
     },
     sheetScrollViewContainer: {
       padding: 16,
+    },
+    visionToggleContainer: {
+      paddingHorizontal: 15,
+      paddingVertical: 8,
+    },
+    visionToggle: {
+      marginVertical: 4,
     },
   });

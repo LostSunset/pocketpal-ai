@@ -13,9 +13,11 @@ import {useTheme} from '../../hooks';
 import {createStyles} from './styles';
 import {modelStore, palStore, chatSessionStore} from '../../store';
 import {CustomBackdrop} from '../Sheet/CustomBackdrop';
-import {getLocalizedModelCapabilities, L10nContext} from '../../utils';
+import {getModelSkills, L10nContext, Model} from '../../utils';
 //import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {CloseIcon} from '../../assets/icons';
+import {PalType} from '../PalsSheets/types';
+import {SkillsDisplay} from '../SkillsDisplay';
 
 type Tab = 'models' | 'pals';
 
@@ -27,6 +29,43 @@ interface ChatPalModelPickerSheetProps {
   onPalSelect?: (palId: string | undefined) => void;
   keyboardHeight: number;
 }
+
+const ObservedSkillsDisplay = observer(({model}) => {
+  const hasProjectionModelWarning =
+    model.supportsMultimodal &&
+    model.visionEnabled &&
+    modelStore.getProjectionModelStatus(model).state === 'missing';
+
+  const toggleVision = async () => {
+    if (!model.supportsMultimodal) {
+      return;
+    }
+    try {
+      await modelStore.setModelVisionEnabled(
+        model.id,
+        !modelStore.getModelVisionPreference(model),
+      );
+    } catch (error) {
+      console.error('Failed to toggle vision setting:', error);
+      // The error is already handled in setModelVisionEnabled (vision state is reverted)
+      // We could show a toast/snackbar here if needed
+    }
+  };
+  const visionEnabled = modelStore.getModelVisionPreference(model);
+
+  return (
+    <SkillsDisplay
+      model={model}
+      hasProjectionModelWarning={hasProjectionModelWarning}
+      onVisionPress={toggleVision}
+      onProjectionWarningPress={() =>
+        model.defaultProjectionModel &&
+        modelStore.checkSpaceAndDownload(model.defaultProjectionModel)
+      }
+      visionEnabled={visionEnabled}
+    />
+  );
+});
 
 export const ChatPalModelPickerSheet = observer(
   ({
@@ -173,8 +212,11 @@ export const ChatPalModelPickerSheet = observer(
     ]);
 
     const renderModelItem = React.useCallback(
-      (model: (typeof modelStore.availableModels)[0]) => {
+      (model: Model) => {
         const isActiveModel = model.id === modelStore.activeModelId;
+        const modelSkills = getModelSkills(model)
+          .flatMap(skill => skill.labelKey)
+          .join(', ');
         return (
           <Pressable
             key={model.id}
@@ -188,19 +230,28 @@ export const ChatPalModelPickerSheet = observer(
                 ]}>
                 {model.name}
               </Text>
-              <Text
-                style={[
-                  styles.itemSubtitle,
-                  isActiveModel && styles.activeItemSubtitle,
-                ]}>
-                {getLocalizedModelCapabilities(model, l10n) ||
-                  l10n.components.chatPalModelPickerSheet.noDescription}
-              </Text>
+              {modelSkills && <ObservedSkillsDisplay model={model} />}
             </View>
           </Pressable>
         );
       },
-      [styles, l10n, handleModelSelect],
+      [styles, handleModelSelect],
+    );
+
+    const palTypeText = React.useCallback(
+      (palType: PalType): string => {
+        switch (palType) {
+          case PalType.ASSISTANT:
+            return l10n.components.chatPalModelPickerSheet.assistantType;
+          case PalType.ROLEPLAY:
+            return l10n.components.chatPalModelPickerSheet.roleplayType;
+          case PalType.VIDEO:
+            return l10n.components.chatPalModelPickerSheet.videoType;
+          default:
+            return '';
+        }
+      },
+      [l10n.components.chatPalModelPickerSheet],
     );
 
     const renderPalItem = React.useCallback(
@@ -224,18 +275,21 @@ export const ChatPalModelPickerSheet = observer(
                   styles.itemSubtitle,
                   isActivePal && styles.activeItemSubtitle,
                 ]}>
-                {pal.palType === 'assistant'
-                  ? l10n.components.chatPalModelPickerSheet.assistantType
-                  : l10n.components.chatPalModelPickerSheet.roleplayType}
+                {palTypeText(pal.palType)}
               </Text>
             </View>
           </Pressable>
         );
       },
       [
-        styles,
-        l10n.components.chatPalModelPickerSheet.assistantType,
-        l10n.components.chatPalModelPickerSheet.roleplayType,
+        styles.listItem,
+        styles.activeListItem,
+        styles.itemContent,
+        styles.itemTitle,
+        styles.activeItemTitle,
+        styles.itemSubtitle,
+        styles.activeItemSubtitle,
+        palTypeText,
         handlePalSelect,
       ],
     );
@@ -279,7 +333,7 @@ export const ChatPalModelPickerSheet = observer(
         enablePanDownToClose
         snapPoints={snapPoints} // Dynamic sizing is not working properly in all situations, like keyboard open/close android/ios ...
         enableDynamicSizing={false}
-        backdropComponent={CustomBackdrop}
+        backdropComponent={isVisible ? CustomBackdrop : null} // on android we need this check to ensure it doenst' block interaction
         backgroundStyle={{
           backgroundColor: theme.colors.background,
         }}

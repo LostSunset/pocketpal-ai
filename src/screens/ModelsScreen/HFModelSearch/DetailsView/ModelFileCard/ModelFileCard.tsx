@@ -1,14 +1,28 @@
-import React, {FC, useState, useContext} from 'react';
+import React, {FC, useState, useContext, useMemo} from 'react';
 import {Alert, View, StyleSheet, Pressable} from 'react-native';
 import {computed} from 'mobx';
 import {observer} from 'mobx-react';
 import LinearGradient from 'react-native-linear-gradient';
-import {IconButton, Text, Tooltip, Snackbar, Portal} from 'react-native-paper';
+import {
+  IconButton,
+  Text,
+  Tooltip,
+  Snackbar,
+  Portal,
+  Chip,
+} from 'react-native-paper';
 
 import {useTheme, useMemoryCheck} from '../../../../../hooks';
 import {createStyles} from './styles';
 import {modelStore} from '../../../../../store';
-import {formatBytes, hfAsModel, L10nContext} from '../../../../../utils';
+import {
+  formatBytes,
+  hfAsModel,
+  L10nContext,
+  isProjectionModel,
+  getVisionModelSizeBreakdown,
+  isVisionRepo,
+} from '../../../../../utils';
 import {isLegacyQuantization} from '../../../../../utils/modelSettings';
 import {
   HuggingFaceModel,
@@ -16,6 +30,8 @@ import {
   ModelFile,
   ModelOrigin,
 } from '../../../../../utils/types';
+import {VisionDownloadSheet} from '../../../../../components';
+import {ChevronRightIcon} from '../../../../../assets/icons';
 
 interface ModelFileCardProps {
   modelFile: ModelFile;
@@ -32,9 +48,19 @@ type Warning = {
 export const ModelFileCard: FC<ModelFileCardProps> = observer(
   ({modelFile, hfModel}) => {
     const [showWarning, setShowWarning] = useState(false);
+    const [showVisionSheet, setShowVisionSheet] = useState(false);
     const theme = useTheme();
     const l10n = useContext(L10nContext);
-    const styles = createStyles(theme);
+
+    // Memoize to prevent unnecessary re-renders
+    const isProjection = useMemo(
+      () => isProjectionModel(modelFile.rfilename),
+      [modelFile.rfilename],
+    );
+    const styles = useMemo(
+      () => createStyles(theme, isProjection),
+      [theme, isProjection],
+    );
     const HF_YELLOW = '#FFD21E';
 
     // Check if we have all the necessary data, as some are fetched async, like size.
@@ -42,9 +68,12 @@ export const ModelFileCard: FC<ModelFileCardProps> = observer(
       modelFile.size !== undefined && modelFile.canFitInStorage !== undefined,
     );
 
-    // Find the model in the store if exitst
-    const modelId = hfAsModel(hfModel, modelFile).id;
-    const storeModel = modelStore.models.find(m => m.id === modelId);
+    const convertedModel = useMemo(
+      () => hfAsModel(hfModel, modelFile),
+      [hfModel, modelFile],
+    );
+
+    const storeModel = modelStore.models.find(m => m.id === convertedModel.id);
 
     const isDownloading = storeModel
       ? modelStore.isDownloading(storeModel.id)
@@ -62,7 +91,10 @@ export const ModelFileCard: FC<ModelFileCardProps> = observer(
       ),
     ).get();
 
-    const {shortMemoryWarning} = useMemoryCheck(hfAsModel(hfModel, modelFile));
+    const {shortMemoryWarning, multimodalWarning} = useMemoryCheck(
+      convertedModel.size,
+      convertedModel.supportsMultimodal,
+    );
 
     const warnings = [
       !modelFile.canFitInStorage && {
@@ -76,6 +108,12 @@ export const ModelFileCard: FC<ModelFileCardProps> = observer(
         icon: 'memory',
         message: l10n.models.modelFile.warnings.memory.message,
         shortMessage: shortMemoryWarning,
+      },
+      multimodalWarning && {
+        type: 'multimodal',
+        icon: 'alert-circle-outline',
+        message: multimodalWarning,
+        shortMessage: l10n.memory.shortWarning,
       },
       isLegacyQuantization(modelFile.rfilename) && {
         type: 'legacy',
@@ -145,7 +183,9 @@ export const ModelFileCard: FC<ModelFileCardProps> = observer(
           l10n.models.modelFile.alerts.alreadyDownloadedMessage,
         );
       } else {
-        modelStore.downloadHFModel(hfModel, modelFile);
+        // Direct download with default projection for all models
+        // VisionDownloadSheet is only opened via the vision chip
+        modelStore.downloadHFModel(hfModel, modelFile, {enableVision: true});
       }
     };
 
@@ -190,6 +230,27 @@ export const ModelFileCard: FC<ModelFileCardProps> = observer(
       setShowWarning(false);
     };
 
+    // Get enhanced size display for vision models
+    const getEnhancedSizeDisplay = () => {
+      if (!modelFile.size) {
+        return '';
+      }
+
+      // Check if this is a vision model
+      const isVision = isVisionRepo(hfModel.siblings || []);
+      const isProjModel = isProjectionModel(modelFile.rfilename);
+      const isVisionLLM = isVision && !isProjModel;
+
+      if (isVisionLLM) {
+        const sizeBreakdown = getVisionModelSizeBreakdown(modelFile, hfModel);
+        if (sizeBreakdown.hasProjection) {
+          return `${formatBytes(sizeBreakdown.totalSize, 2, false, true)}`;
+        }
+      }
+
+      return formatBytes(modelFile.size, 2, false, true);
+    };
+
     return (
       <View style={styles.fileCardContainer}>
         <LinearGradient
@@ -216,7 +277,7 @@ export const ModelFileCard: FC<ModelFileCardProps> = observer(
               <View style={styles.metadataRow}>
                 {isModelInfoReady && modelFile.size && (
                   <Text variant="labelSmall" style={styles.fileSize}>
-                    {formatBytes(modelFile.size, 2, false, true)}
+                    {getEnhancedSizeDisplay()}
                   </Text>
                 )}
                 {isModelInfoReady && warnings.length > 0 && (
@@ -253,6 +314,29 @@ export const ModelFileCard: FC<ModelFileCardProps> = observer(
                   </View>
                 )}
               </View>
+
+              {/* Vision indicator chip for multimodal models */}
+              {convertedModel.supportsMultimodal && (
+                <View style={styles.visionChipContainer}>
+                  <Chip
+                    mode="flat"
+                    compact
+                    icon="eye"
+                    style={styles.visionChip}
+                    textStyle={styles.visionChipText}
+                    onPress={() => setShowVisionSheet(true)}>
+                    {isDownloaded
+                      ? l10n.models.multimodal.visionControls.visionEnabled
+                      : l10n.models.multimodal.visionControls
+                          .includesVisionCapability}
+                  </Chip>
+                  <ChevronRightIcon
+                    width={16}
+                    height={16}
+                    stroke={theme.colors.onSurfaceVariant}
+                  />
+                </View>
+              )}
 
               {/* Download Speed */}
               {isDownloading && downloadSpeed && (
@@ -334,6 +418,15 @@ export const ModelFileCard: FC<ModelFileCardProps> = observer(
             </View>
           </Snackbar>
         </Portal>
+
+        {/* Vision Download Options Sheet */}
+        <VisionDownloadSheet
+          isVisible={showVisionSheet}
+          onClose={() => setShowVisionSheet(false)}
+          hfModel={hfModel}
+          modelFile={modelFile}
+          convertedModel={convertedModel}
+        />
       </View>
     );
   },
